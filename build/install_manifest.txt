@@ -1,2 +1,0 @@
-/home/arthur/.local/bin/pass-manager
-/home/arthur/.local/share/applications/pass-manager.desktop

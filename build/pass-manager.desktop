@@ -1,8 +1,0 @@
-[Desktop Entry]
-Type=Application
-Name=Pass Manager
-Comment=Gerenciador de senhas local e criptografado
-Exec=/home/arthur/.local/bin/pass-manager
-Icon=dialog-password
-Categories=Utility;Security;
-Terminal=false
