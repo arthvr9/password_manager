@@ -348,6 +348,21 @@ bool Vault::verifyPassword(QByteArray password)
     return ok;
 }
 
+bool Vault::resetRecovery(QByteArray password, const QByteArray &plain, QString &recovery)
+{
+    recovery.clear();
+    if (!verifyPassword(std::move(password))) return false;
+    unsigned char oldSalt[kSalt], oldSlot[kSlot];
+    memcpy(oldSalt, recSalt_, kSalt);
+    memcpy(oldSlot, recSlot_, kSlot);
+    newRecovery(recovery);
+    if (save(plain)) return true;
+    memcpy(recSalt_, oldSalt, kSalt);
+    memcpy(recSlot_, oldSlot, kSlot);
+    recovery.clear();
+    return false;
+}
+
 // v1: the Argon2id output was the data key. Decrypt, then rewrite as v2 reusing that same
 // Argon2id output (same salt and params) as the password key, so no second hash is needed.
 bool Vault::openV1(const QByteArray &data, QByteArray &password, QByteArray &plain, QString &recovery)

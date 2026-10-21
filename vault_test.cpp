@@ -80,6 +80,13 @@ static void roundtrip(const QString &path, const QString &creds)
         assert(Vault(path, creds).open("battery staple", plain, none));
         assert(!Vault(path, creds).open("correct horse", plain, none));
         assert(Vault(path, creds).openWithRecovery(recovery, plain)); // recovery slot survives a password change
+
+        QString fresh;
+        assert(!v.resetRecovery("wrong", plain, fresh) && fresh.isEmpty());
+        assert(v.resetRecovery("battery staple", plain, fresh) && fresh.size() == 39 && fresh != recovery);
+        assert(!Vault(path, creds).openWithRecovery(recovery, plain));
+        assert(Vault(path, creds).openWithRecovery(fresh, plain));
+        recovery = fresh;
     }
     {
         // any header byte changed is rejected (cheap through the recovery path: no Argon2id)

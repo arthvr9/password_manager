@@ -30,6 +30,8 @@ public:
     bool verifyPassword(QByteArray password);
     // re-wraps K under a new password and TPM secret and saves `plain`; on failure nothing changes
     bool setPassword(QByteArray password, const QByteArray &plain);
+    // verifies the password, replaces the recovery slot and saves; the old key stops working
+    bool resetRecovery(QByteArray password, const QByteArray &plain, QString &recovery);
     bool save(const QByteArray &plain);
     void close(); // wipes K
 

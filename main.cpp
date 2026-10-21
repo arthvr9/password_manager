@@ -43,6 +43,7 @@ QPushButton:pressed { background: #1c1e22; }
 QPushButton:disabled { color: #5b5e64; }
 QPushButton#primary { background: #6b93e6; border-color: #6b93e6; color: #0d0e10; font-weight: 600; }
 QPushButton#primary:hover { background: #7da1ea; }
+QPushButton#primary:disabled { background: #262c3a; border-color: #262c3a; color: #626a7c; }
 QPushButton#danger { background: transparent; border-color: transparent; color: #e5736f; }
 QPushButton#danger:hover { background: #2a1d1d; }
 QPushButton#flat { background: transparent; border-color: transparent; color: #a9acb2; }
@@ -127,9 +128,10 @@ public:
     explicit GeneratorDialog(QWidget *parent) : QDialog(parent)
     {
         setWindowTitle("Gerar senha");
-        setMinimumWidth(420);
         auto *lay = new QVBoxLayout(this);
+        lay->setSizeConstraint(QLayout::SetFixedSize); // see RecoveryDialog
         lay->setContentsMargins(20, 20, 20, 20);
+        lay->addStrut(380); // content width; setMinimumWidth is overridden by SetFixedSize
         lay->setSpacing(10);
 
         preview_ = new QLineEdit;
@@ -206,9 +208,12 @@ public:
     RecoveryDialog(QWidget *parent, const QString &key, const QString &intro) : QDialog(parent)
     {
         setWindowTitle("Chave de recuperação");
-        setMinimumWidth(460);
         auto *lay = new QVBoxLayout(this);
+        // Word-wrapped labels make Qt underestimate the minimum height; GNOME then opened the
+        // dialog at that minimum and clipped the key. Fixed size = the layout's real size.
+        lay->setSizeConstraint(QLayout::SetFixedSize);
         lay->setContentsMargins(24, 24, 24, 20);
+        lay->addStrut(412); // content width; setMinimumWidth is overridden by SetFixedSize
         lay->setSpacing(12);
         auto *text = new QLabel(intro);
         text->setWordWrap(true);
@@ -248,9 +253,10 @@ public:
         : QDialog(parent), apply_(std::move(apply))
     {
         setWindowTitle(title);
-        setMinimumWidth(400);
         auto *lay = new QVBoxLayout(this);
+        lay->setSizeConstraint(QLayout::SetFixedSize); // see RecoveryDialog
         lay->setContentsMargins(24, 24, 24, 20);
+        lay->addStrut(352);
         lay->setSpacing(10);
         auto *h = label(hint, "muted");
         h->setWordWrap(true);
@@ -586,6 +592,31 @@ private:
         if (d.exec() == QDialog::Accepted) statusBar()->showMessage("Senha mestra alterada", 3000);
     }
 
+    void resetRecoveryKey()
+    {
+        bool ok = false;
+        const QString password = QInputDialog::getText(this, "Nova chave de recuperação",
+                                                       "Digite a senha mestra. A chave de recuperação atual deixa de valer.",
+                                                       QLineEdit::Password, QString(), &ok);
+        if (!ok || password.isEmpty() || !vault_.isOpen()) return;
+        QApplication::setOverrideCursor(Qt::WaitCursor);
+        QByteArray plain = serialize();
+        QString recovery;
+        const bool reset = vault_.resetRecovery(password.toUtf8(), plain, recovery);
+        sodium_memzero(plain.data(), plain.size());
+        QApplication::restoreOverrideCursor();
+        if (!reset) {
+            QMessageBox::warning(this, "Nova chave de recuperação", vault_.error);
+            return;
+        }
+        saveTimer_.stop(); // that save already included any pending edit
+        holdIdle_ = true;
+        idleTimer_.stop();
+        RecoveryDialog(this, recovery, "Esta é a nova chave de recuperação. A anterior não abre mais o cofre.").exec();
+        holdIdle_ = false;
+        if (vault_.isOpen()) idleTimer_.start();
+    }
+
     void updateTpmLabel()
     {
         tpmLabel_->setText(vault_.usesTpm() ? "Protegido por TPM" : "Sem TPM, só senha mestra");
@@ -672,6 +703,7 @@ private:
         catLabel->setContentsMargins(14, 0, 0, 0);
         sidebar_ = new QListWidget;
         sidebar_->setObjectName("sidebar");
+        auto *recoveryKeyBtn = button("Chave de recuperação", "flat");
         auto *passBtn = button("Trocar senha mestra", "flat");
         auto *lockBtn = button("Bloquear  (Ctrl+L)", "flat");
         sideLay->addWidget(catLabel);
@@ -679,6 +711,7 @@ private:
         auto *actions = new QVBoxLayout;
         actions->setContentsMargins(8, 0, 8, 0);
         actions->setSpacing(2);
+        actions->addWidget(recoveryKeyBtn);
         actions->addWidget(passBtn);
         actions->addWidget(lockBtn);
         sideLay->addLayout(actions);
@@ -725,6 +758,7 @@ private:
 
         connect(lockBtn, &QPushButton::clicked, this, &MainWindow::lock);
         connect(passBtn, &QPushButton::clicked, this, &MainWindow::changePassword);
+        connect(recoveryKeyBtn, &QPushButton::clicked, this, &MainWindow::resetRecoveryKey);
         connect(newBtn, &QPushButton::clicked, this, &MainWindow::newEntry);
         connect(search_, &QLineEdit::textChanged, this, &MainWindow::refreshList);
         connect(sidebar_, &QListWidget::currentRowChanged, this, &MainWindow::refreshList);
@@ -1051,7 +1085,7 @@ int main(int argc, char **argv)
     if (!refused.isEmpty()) qWarning("pass-manager: kernel refused sandbox layers: %s", qPrintable(refused));
 
     QApplication app(argc, argv);
-    app.setApplicationDisplayName("Pass Manager");
+    // no setApplicationDisplayName: Qt would append " — Pass Manager" to every dialog title
     app.setDesktopFileName("pass-manager");
     app.setWindowIcon(QIcon::fromTheme("dialog-password"));
     app.setStyle("Fusion");

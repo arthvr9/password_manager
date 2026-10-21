@@ -27,7 +27,7 @@ Cada entrada tem título, categoria, usuário, senha, URL e notas. Tem busca, fi
 
 Na tela de desbloqueio tem "Usar chave de recuperação". Depois de entrar com ela, o app pede uma senha mestra nova e sela um segredo novo no TPM da máquina atual. É assim também que se leva o cofre pra outro computador, ou que se recupera depois de trocar placa-mãe ou limpar o TPM na BIOS.
 
-A senha mestra dá pra trocar a qualquer momento pela barra lateral. A chave de recuperação continua a mesma.
+A senha mestra dá pra trocar a qualquer momento pela barra lateral, e a chave de recuperação continua a mesma. Se perder a chave (ou não tiver anotado), "Chave de recuperação" na barra lateral gera outra pedindo a senha mestra, e a antiga deixa de valer.
 
 **Perdeu a senha mestra e a chave de recuperação, perdeu o cofre.**
 
@@ -124,4 +124,3 @@ git log --show-signature
 ## Falta fazer
 
 - renomear categoria (hoje é só editar o campo em cada entrada)
-- gerar uma chave de recuperação nova sem precisar recriar o cofre
