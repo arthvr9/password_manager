@@ -1,10 +1,13 @@
 #include "vault.h"
 #include <QtDBus>
 #include <QtWidgets>
+#include <fcntl.h>
 #include <sodium.h>
+#include <sys/file.h>
 #include <sys/prctl.h>
 
 static constexpr int kAutoLockMs = 5 * 60 * 1000;
+static const char *kBusName = "io.github.arthvr9.PassManager";
 
 struct Entry {
     QString id, title, user, pass, url, notes, category;
@@ -184,6 +187,7 @@ private:
 
 class MainWindow : public QMainWindow {
     Q_OBJECT
+    Q_CLASSINFO("D-Bus Interface", "io.github.arthvr9.PassManager")
 public:
     MainWindow()
         : vault_(QStandardPaths::writableLocation(QStandardPaths::AppDataLocation) + "/vault.bin")
@@ -212,6 +216,11 @@ public:
                     "ActiveChanged", this, SLOT(onScreenSaver(bool)));
         bus.connect("org.freedesktop.ScreenSaver", "/org/freedesktop/ScreenSaver", "org.freedesktop.ScreenSaver",
                     "ActiveChanged", this, SLOT(onScreenSaver(bool)));
+        // and before suspend, or when logind asks the session to lock (empty path matches any session)
+        auto sys = QDBusConnection::systemBus();
+        sys.connect("org.freedesktop.login1", "/org/freedesktop/login1", "org.freedesktop.login1.Manager",
+                    "PrepareForSleep", this, SLOT(onScreenSaver(bool)));
+        sys.connect("org.freedesktop.login1", "", "org.freedesktop.login1.Session", "Lock", this, SLOT(onSessionLock()));
 
         auto sc = [this](QKeySequence k, auto fn) {
             connect(new QShortcut(k, this), &QShortcut::activated, this, [this, fn] {
@@ -249,11 +258,22 @@ protected:
         e->accept();
     }
 
+public slots:
+    // called over D-Bus by a second launch, which exits right after
+    Q_SCRIPTABLE void activate()
+    {
+        show();
+        setWindowState(windowState() & ~Qt::WindowMinimized);
+        raise();
+        activateWindow();
+    }
+
 private slots:
     void onScreenSaver(bool active)
     {
         if (active) lock();
     }
+    void onSessionLock() { lock(); }
 
 private:
     // ---------- unlock page ----------
@@ -787,7 +807,24 @@ int main(int argc, char **argv)
     app.setPalette(pal);
     app.setStyleSheet(kStyle);
 
+    const QString dataDir = QStandardPaths::writableLocation(QStandardPaths::AppDataLocation);
+    QDir().mkpath(dataDir);
+    QFile::setPermissions(dataDir, QFileDevice::ReadOwner | QFileDevice::WriteOwner | QFileDevice::ExeOwner);
+
+    // Two instances would overwrite each other's saves. flock is released by the kernel even on a crash.
+    const int lockFd = open(QFile::encodeName(dataDir + "/lock").constData(), O_RDWR | O_CREAT | O_CLOEXEC, 0600);
+    if (lockFd < 0) {
+        QMessageBox::critical(nullptr, "Pass Manager", "Não foi possível abrir " + dataDir + "/lock");
+        return 1;
+    }
+    if (flock(lockFd, LOCK_EX | LOCK_NB) != 0) {
+        QDBusInterface(kBusName, "/", kBusName).call("activate");
+        return 0;
+    }
+
     MainWindow w;
+    QDBusConnection::sessionBus().registerService(kBusName);
+    QDBusConnection::sessionBus().registerObject("/", &w, QDBusConnection::ExportScriptableSlots);
     w.show();
     return app.exec();
 }
