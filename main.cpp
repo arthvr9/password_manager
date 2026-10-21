@@ -198,37 +198,46 @@ static QHBoxLayout *rightAligned(std::initializer_list<QWidget *> ws)
     return r;
 }
 
-// Shown once. The checkbox is there so it isn't dismissed by reflex.
-static void showRecoveryKey(QWidget *parent, const QString &key, const QString &intro)
-{
-    QDialog d(parent);
-    d.setWindowTitle("Chave de recuperação");
-    d.setMinimumWidth(460);
-    auto *lay = new QVBoxLayout(&d);
-    lay->setContentsMargins(24, 24, 24, 20);
-    lay->setSpacing(12);
-    auto *text = new QLabel(intro);
-    text->setWordWrap(true);
-    auto *keyLabel = label(key, "recovery");
-    keyLabel->setTextInteractionFlags(Qt::TextSelectableByMouse);
-    keyLabel->setAlignment(Qt::AlignCenter);
-    auto *hint = label("Ela abre o cofre se você esquecer a senha mestra ou se o TPM desta máquina for trocado. "
-                       "Guarde fora do computador. Ela não vai aparecer de novo.",
-                       "muted");
-    hint->setWordWrap(true);
-    auto *check = new QCheckBox("Anotei a chave em um lugar seguro");
-    auto *ok = button("Continuar", "primary");
-    ok->setEnabled(false);
-    QObject::connect(check, &QCheckBox::toggled, ok, &QPushButton::setEnabled);
-    QObject::connect(ok, &QPushButton::clicked, &d, &QDialog::accept);
-    lay->addWidget(text);
-    lay->addWidget(keyLabel);
-    lay->addWidget(hint);
-    lay->addSpacing(4);
-    lay->addWidget(check);
-    lay->addLayout(rightAligned({ok}));
-    d.exec();
-}
+// Shown once, and the key can't be shown again, so it only closes after the checkbox is ticked
+// (Esc, the close button and lock() all go through reject()). Not selectable: copying it would
+// land in clipboard history.
+class RecoveryDialog : public QDialog {
+public:
+    RecoveryDialog(QWidget *parent, const QString &key, const QString &intro) : QDialog(parent)
+    {
+        setWindowTitle("Chave de recuperação");
+        setMinimumWidth(460);
+        auto *lay = new QVBoxLayout(this);
+        lay->setContentsMargins(24, 24, 24, 20);
+        lay->setSpacing(12);
+        auto *text = new QLabel(intro);
+        text->setWordWrap(true);
+        auto *keyLabel = label(key, "recovery");
+        keyLabel->setAlignment(Qt::AlignCenter);
+        auto *hint = label("Ela abre o cofre se você esquecer a senha mestra ou se o TPM desta máquina for trocado. "
+                           "Guarde fora do computador. Ela não vai aparecer de novo.",
+                           "muted");
+        hint->setWordWrap(true);
+        check_ = new QCheckBox("Anotei a chave em um lugar seguro");
+        auto *ok = button("Continuar", "primary");
+        ok->setEnabled(false);
+        connect(check_, &QCheckBox::toggled, ok, &QPushButton::setEnabled);
+        connect(ok, &QPushButton::clicked, this, &QDialog::accept);
+        lay->addWidget(text);
+        lay->addWidget(keyLabel);
+        lay->addWidget(hint);
+        lay->addSpacing(4);
+        lay->addWidget(check_);
+        lay->addLayout(rightAligned({ok}));
+    }
+    void reject() override
+    {
+        if (check_->isChecked()) QDialog::reject();
+    }
+
+private:
+    QCheckBox *check_;
+};
 
 // Sets a new master password, asking for the current one first if needed.
 // `apply` gets (current, next) and returns an error message, or an empty string on success.
@@ -329,7 +338,7 @@ public:
 
         saveTimer_.setSingleShot(true);
         saveTimer_.setInterval(400);
-        connect(&saveTimer_, &QTimer::timeout, this, &MainWindow::persist);
+        connect(&saveTimer_, &QTimer::timeout, this, [this] { persist(); });
 
         idleTimer_.setSingleShot(true);
         idleTimer_.setInterval(kAutoLockMs);
@@ -342,11 +351,17 @@ public:
                     "ActiveChanged", this, SLOT(onScreenSaver(bool)));
         bus.connect("org.freedesktop.ScreenSaver", "/org/freedesktop/ScreenSaver", "org.freedesktop.ScreenSaver",
                     "ActiveChanged", this, SLOT(onScreenSaver(bool)));
-        // and before suspend, or when logind asks the session to lock (empty path matches any session)
+        // and before suspend (holding a delay inhibitor so logind waits for us), and when logind
+        // asks this session to lock. "auto" resolves to the caller's or the user's display session;
+        // if that fails the empty path matches every session, which only over-locks.
         auto sys = QDBusConnection::systemBus();
         sys.connect("org.freedesktop.login1", "/org/freedesktop/login1", "org.freedesktop.login1.Manager",
-                    "PrepareForSleep", this, SLOT(onScreenSaver(bool)));
-        sys.connect("org.freedesktop.login1", "", "org.freedesktop.login1.Session", "Lock", this, SLOT(onSessionLock()));
+                    "PrepareForSleep", this, SLOT(onPrepareForSleep(bool)));
+        QDBusInterface login1("org.freedesktop.login1", "/org/freedesktop/login1", "org.freedesktop.login1.Manager", sys);
+        const QDBusReply<QDBusObjectPath> session = login1.call("GetSession", "auto");
+        sys.connect("org.freedesktop.login1", session.isValid() ? session.value().path() : QString(),
+                    "org.freedesktop.login1.Session", "Lock", this, SLOT(onSessionLock()));
+        takeSleepInhibitor();
 
         auto sc = [this](QKeySequence k, auto fn) {
             connect(new QShortcut(k, this), &QShortcut::activated, this, [this, fn] {
@@ -370,7 +385,7 @@ protected:
         case QEvent::MouseButtonPress:
         case QEvent::MouseMove:
         case QEvent::Wheel:
-            if (vault_.isOpen()) idleTimer_.start();
+            if (vault_.isOpen() && !holdIdle_) idleTimer_.start();
             break;
         default:
             break;
@@ -380,7 +395,12 @@ protected:
 
     void closeEvent(QCloseEvent *e) override
     {
-        if (saveTimer_.isActive()) persist();
+        if (saveTimer_.isActive() && !persist() &&
+            QMessageBox::question(this, "Sair sem salvar",
+                                  "As últimas alterações não foram salvas. Sair mesmo assim?") != QMessageBox::Yes) {
+            e->ignore();
+            return;
+        }
         e->accept();
     }
 
@@ -400,6 +420,12 @@ private slots:
         if (active) lock();
     }
     void onSessionLock() { lock(); }
+    void onPrepareForSleep(bool sleeping)
+    {
+        if (!sleeping) return takeSleepInhibitor();
+        lock();
+        sleepInhibitor_ = QDBusUnixFileDescriptor(); // closing the fd lets the suspend go ahead
+    }
 
 private:
     // ---------- unlock page ----------
@@ -518,15 +544,20 @@ private:
         stack_->setCurrentIndex(1);
         statusBar()->show();
         updateTpmLabel();
-        idleTimer_.start();
         search_->setFocus();
 
-        if (!recovery.isEmpty())
-            showRecoveryKey(this, recovery,
-                            first ? "Cofre criado. Esta é a sua chave de recuperação:"
-                                  : "O cofre foi atualizado para o formato novo, com chave de recuperação e "
-                                    "proteção pelo TPM desta máquina. Esta é a sua chave:");
-        if (recovering) {
+        if (!recovery.isEmpty()) {
+            const QString intro = first                ? "Cofre criado. Esta é a sua chave de recuperação:"
+                                  : vault_.usesTpm() ? "O cofre foi atualizado para o formato novo, com chave de "
+                                                       "recuperação e proteção pelo TPM desta máquina. Esta é a sua chave:"
+                                                     : "O cofre foi atualizado para o formato novo, com chave de "
+                                                       "recuperação. Esta é a sua chave:";
+            holdIdle_ = true; // an idle lock can't dismiss it anyway; don't count down behind it
+            RecoveryDialog(this, recovery, intro).exec();
+            holdIdle_ = false;
+        }
+        if (vault_.isOpen()) idleTimer_.start();
+        if (recovering && vault_.isOpen()) {
             recoveryMode_ = false;
             PasswordDialog d(this, "Nova senha mestra", "Acesso recuperado. Defina uma nova senha mestra para continuar.",
                              false, [this](QByteArray, QByteArray next) { return applyPassword(std::move(next)); });
@@ -536,8 +567,11 @@ private:
 
     QString applyPassword(QByteArray next)
     {
-        if (!vault_.setPassword(std::move(next))) return vault_.error;
-        if (!persist()) return vault_.error;
+        QByteArray plain = serialize();
+        const bool ok = vault_.setPassword(std::move(next), plain);
+        sodium_memzero(plain.data(), plain.size());
+        if (!ok) return vault_.error;
+        saveTimer_.stop(); // that save already included any pending edit
         updateTpmLabel();
         return {};
     }
@@ -560,7 +594,12 @@ private:
     void lock()
     {
         if (!vault_.isOpen()) return;
-        if (saveTimer_.isActive()) persist();
+        // no dialog outlives the vault (RecoveryDialog refuses until acknowledged)
+        for (QDialog *d : findChildren<QDialog *>())
+            if (d->isVisible()) d->reject();
+        // save quietly: a message box here would keep the vault open on screen until dismissed
+        const bool saved = !saveTimer_.isActive() || persist(false);
+        const QString saveError = vault_.error;
         idleTimer_.stop();
         vault_.close();
         recoveryMode_ = false;
@@ -571,6 +610,10 @@ private:
         sidebar_->clear();
         clearForm();
         showUnlock();
+        if (!saved)
+            QTimer::singleShot(0, this, [this, saveError] {
+                QMessageBox::critical(this, "Erro ao salvar", "As últimas alterações não foram salvas. " + saveError);
+            });
     }
 
     void load(const QByteArray &plain)
@@ -584,21 +627,35 @@ private:
         }
     }
 
-    bool persist()
+    QByteArray serialize() const
     {
-        saveTimer_.stop();
         QJsonArray arr;
         for (const Entry &e : entries_)
             arr.append(QJsonObject{{"id", e.id}, {"title", e.title}, {"user", e.user}, {"pass", e.pass},
                                    {"url", e.url}, {"notes", e.notes}, {"category", e.category}});
-        QByteArray plain = QJsonDocument(QJsonObject{{"entries", arr}}).toJson(QJsonDocument::Compact);
+        return QJsonDocument(QJsonObject{{"entries", arr}}).toJson(QJsonDocument::Compact);
+    }
+
+    bool persist(bool report = true)
+    {
+        saveTimer_.stop();
+        QByteArray plain = serialize();
         const bool ok = vault_.save(plain);
         sodium_memzero(plain.data(), plain.size());
         if (ok)
             statusBar()->showMessage("Salvo", 2000);
-        else
+        else if (report)
             QMessageBox::critical(this, "Erro ao salvar", vault_.error);
         return ok;
+    }
+
+    void takeSleepInhibitor()
+    {
+        QDBusInterface login1("org.freedesktop.login1", "/org/freedesktop/login1", "org.freedesktop.login1.Manager",
+                              QDBusConnection::systemBus());
+        const QDBusReply<QDBusUnixFileDescriptor> fd =
+            login1.call("Inhibit", "sleep", "Pass Manager", "Bloquear o cofre antes de suspender", "delay");
+        if (fd.isValid()) sleepInhibitor_ = fd.value();
     }
 
     // ---------- main page ----------
@@ -939,7 +996,8 @@ private:
         if (!e) return;
         const QString name = e->title.isEmpty() ? "(sem título)" : e->title;
         if (QMessageBox::question(this, "Excluir entrada", QString("Excluir \"%1\"? Não dá para desfazer.").arg(name)) !=
-            QMessageBox::Yes)
+                QMessageBox::Yes ||
+            !vault_.isOpen()) // locked while the question was open
             return;
         entries_.erase(std::remove_if(entries_.begin(), entries_.end(), [&](const Entry &x) { return x.id == currentId_; }),
                        entries_.end());
@@ -961,8 +1019,9 @@ private:
     Vault vault_;
     std::vector<Entry> entries_;
     QString currentId_;
-    bool loading_ = false, recoveryMode_ = false;
+    bool loading_ = false, recoveryMode_ = false, holdIdle_ = false;
     QTimer saveTimer_, idleTimer_;
+    QDBusUnixFileDescriptor sleepInhibitor_;
 
     QStackedWidget *stack_, *detail_;
     QLabel *unlockTitle_, *unlockHint_, *unlockError_;
@@ -980,8 +1039,18 @@ int main(int argc, char **argv)
     prctl(PR_SET_DUMPABLE, 0); // no core dumps, no ptrace from other same-user processes
     if (sodium_init() < 0) return 1;
 
+    // Landlock binds only threads created after it and QApplication starts several, so the
+    // sandbox goes first. Computing the paths only needs the application name.
+    QCoreApplication::setApplicationName("pass-manager");
+    const QString dataDir = QStandardPaths::writableLocation(QStandardPaths::AppDataLocation);
+    const QString cacheDir = QStandardPaths::writableLocation(QStandardPaths::GenericCacheLocation);
+    QDir().mkpath(dataDir);
+    QDir().mkpath(cacheDir);
+    QFile::setPermissions(dataDir, QFileDevice::ReadOwner | QFileDevice::WriteOwner | QFileDevice::ExeOwner);
+    const QString refused = sandbox({dataDir, cacheDir});
+    if (!refused.isEmpty()) qWarning("pass-manager: kernel refused sandbox layers: %s", qPrintable(refused));
+
     QApplication app(argc, argv);
-    app.setApplicationName("pass-manager");
     app.setApplicationDisplayName("Pass Manager");
     app.setDesktopFileName("pass-manager");
     app.setWindowIcon(QIcon::fromTheme("dialog-password"));
@@ -1003,10 +1072,6 @@ int main(int argc, char **argv)
     app.setPalette(pal);
     app.setStyleSheet(kStyle);
 
-    const QString dataDir = QStandardPaths::writableLocation(QStandardPaths::AppDataLocation);
-    QDir().mkpath(dataDir);
-    QFile::setPermissions(dataDir, QFileDevice::ReadOwner | QFileDevice::WriteOwner | QFileDevice::ExeOwner);
-
     // Two instances would overwrite each other's saves. flock is released by the kernel even on a crash.
     const int lockFd = open(QFile::encodeName(dataDir + "/lock").constData(), O_RDWR | O_CREAT | O_CLOEXEC, 0600);
     if (lockFd < 0) {
@@ -1014,14 +1079,11 @@ int main(int argc, char **argv)
         return 1;
     }
     if (flock(lockFd, LOCK_EX | LOCK_NB) != 0) {
-        QDBusInterface(kBusName, "/", kBusName).call("activate");
+        // no reply: the other instance is in another login session (separate session bus)
+        if (QDBusInterface(kBusName, "/", kBusName).call("activate").type() == QDBusMessage::ErrorMessage)
+            QMessageBox::information(nullptr, "Pass Manager", "O Pass Manager já está aberto em outra sessão.");
         return 0;
     }
-
-    const QString cacheDir = QStandardPaths::writableLocation(QStandardPaths::GenericCacheLocation);
-    QDir().mkpath(cacheDir);
-    const QString refused = sandbox({dataDir, cacheDir});
-    if (!refused.isEmpty()) qWarning("pass-manager: kernel refused sandbox layers: %s", qPrintable(refused));
 
     MainWindow w;
     QDBusConnection::sessionBus().registerService(kBusName);

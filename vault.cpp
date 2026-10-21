@@ -13,8 +13,8 @@ static constexpr int kSalt = 16, kNonce = crypto_aead_xchacha20poly1305_ietf_NPU
 static constexpr int kKey = 32, kTag = crypto_aead_xchacha20poly1305_ietf_ABYTES;
 static constexpr int kSlot = kNonce + kKey + kTag, kRecovery = 16, kMaxCred = 8192;
 static constexpr int kV1Header = 4 + kSalt + 8 + 8 + kNonce;
-static const char *kCreds = "/usr/bin/systemd-creds";
-
+static const char *kSealError = "Não foi possível selar a chave no TPM. Tente de novo.";
+static const char *kLocked = "O cofre está bloqueado.";
 static const char *kTpmError = "Não foi possível usar o TPM desta máquina. Se o cofre veio de outro computador "
                                "ou o TPM foi limpo, use a chave de recuperação.";
 
@@ -22,10 +22,10 @@ static_assert(kSlot == 72, "slot size is part of the file format, see vault.h");
 
 // ---------- systemd-creds ----------
 
-static std::unique_ptr<QProcess> creds(const QStringList &args, const QByteArray &input)
+static std::unique_ptr<QProcess> creds(const QString &bin, const QStringList &args, const QByteArray &input)
 {
     auto p = std::make_unique<QProcess>();
-    p->start(kCreds, QStringList{"--user"} + args);
+    p->start(bin, QStringList{"--user"} + args);
     if (p->waitForStarted(5000)) {
         p->write(input);
         p->closeWriteChannel();
@@ -41,10 +41,18 @@ static bool credsFinish(QProcess &p, QByteArray &out)
 }
 
 // No PCR binding on purpose: a firmware update would otherwise lock the vault.
-static std::unique_ptr<QProcess> seal(const unsigned char *secret)
+static std::unique_ptr<QProcess> seal(const QString &bin, const unsigned char *secret)
 {
-    return creds({"encrypt", "--with-key=tpm2+host", "--tpm2-pcrs=", "--name=pass-manager", "-", "-"},
-                 QByteArray(reinterpret_cast<const char *>(secret), kKey));
+    QByteArray input(reinterpret_cast<const char *>(secret), kKey);
+    auto p = creds(bin, {"encrypt", "--with-key=tpm2+host", "--tpm2-pcrs=", "--name=pass-manager", "-", "-"}, input);
+    sodium_memzero(input.data(), input.size());
+    return p;
+}
+
+// A blob parse() would reject must never reach save(), or both slots become unreachable.
+static bool sealFinish(QProcess &p, QByteArray &cred)
+{
+    return credsFinish(p, cred) && !cred.isEmpty() && cred.size() <= kMaxCred;
 }
 
 // ---------- key wrapping ----------
@@ -68,10 +76,15 @@ static unsigned char *allocKey()
 
 // ---------- Vault ----------
 
-Vault::Vault(QString path, bool useTpm) : path_(std::move(path)), useTpm_(useTpm) {}
+Vault::Vault(QString path, QString credsBin) : path_(std::move(path)), creds_(std::move(credsBin)) {}
 Vault::~Vault() { close(); }
 
 bool Vault::exists() const { return QFile::exists(path_); }
+
+bool Vault::tpmPresent() const
+{
+    return !creds_.isEmpty() && QFile::exists(creds_) && QFile::exists("/dev/tpmrm0");
+}
 
 void Vault::close()
 {
@@ -119,7 +132,7 @@ bool Vault::passwordKek(QByteArray &password, unsigned char *kek)
 {
     // unseal runs in parallel with Argon2id; both take about a second
     std::unique_ptr<QProcess> tpm;
-    if (!cred_.isEmpty()) tpm = creds({"decrypt", "--name=pass-manager", "-", "-"}, cred_);
+    if (!cred_.isEmpty()) tpm = creds(creds_, {"decrypt", "--name=pass-manager", "-", "-"}, cred_);
 
     unsigned char pwKey[kKey];
     const int rc = crypto_pwhash(pwKey, kKey, password.constData(), password.size(), pwSalt_, ops_, mem_,
@@ -143,13 +156,17 @@ bool Vault::passwordKek(QByteArray &password, unsigned char *kek)
     return true;
 }
 
-bool Vault::setPassword(QByteArray password)
+bool Vault::setPassword(QByteArray password, const QByteArray &plain)
 {
-    if (!key_) return false;
+    if (!key_) {
+        sodium_memzero(password.data(), password.size());
+        error = kLocked;
+        return false;
+    }
     unsigned char salt[kSalt], secret[kKey], pwKey[kKey], kek[kKey];
     randombytes_buf(salt, kSalt);
     randombytes_buf(secret, kKey);
-    auto sealing = useTpm_ ? seal(secret) : nullptr;
+    auto sealing = tpmPresent() ? seal(creds_, secret) : nullptr;
 
     const quint64 ops = crypto_pwhash_OPSLIMIT_MODERATE, mem = crypto_pwhash_MEMLIMIT_MODERATE;
     const int rc = crypto_pwhash(pwKey, kKey, password.constData(), password.size(), salt, ops, mem,
@@ -161,22 +178,41 @@ bool Vault::setPassword(QByteArray password)
         return false;
     }
 
-    // ponytail: no TPM (or systemd-creds failed) falls back to password-only; usesTpm() reports it
     QByteArray cred;
-    if (!sealing || !credsFinish(*sealing, cred)) cred.clear();
-    crypto_generichash(kek, kKey, cred.isEmpty() ? nullptr : secret, cred.isEmpty() ? 0 : kKey, pwKey, kKey);
+    const bool sealFailed = sealing && !sealFinish(*sealing, cred);
+    if (!sealFailed)
+        crypto_generichash(kek, kKey, cred.isEmpty() ? nullptr : secret, cred.isEmpty() ? 0 : kKey, pwKey, kKey);
+    sodium_memzero(secret, kKey);
+    sodium_memzero(pwKey, kKey);
+    if (sealFailed) {
+        error = kSealError;
+        return false;
+    }
+
+    // keep the old slot so a failed save leaves memory matching the file
+    unsigned char oldSalt[kSalt], oldSlot[kSlot];
+    memcpy(oldSalt, pwSalt_, kSalt);
+    memcpy(oldSlot, pwSlot_, kSlot);
+    const quint64 oldOps = ops_, oldMem = mem_;
+    const QByteArray oldCred = cred_;
+
     memcpy(pwSalt_, salt, kSalt);
     ops_ = ops;
     mem_ = mem;
     cred_ = cred;
     wrap(kek, key_, pwSlot_);
-    sodium_memzero(secret, kKey);
-    sodium_memzero(pwKey, kKey);
     sodium_memzero(kek, kKey);
-    return true;
+    if (save(plain)) return true;
+
+    memcpy(pwSalt_, oldSalt, kSalt);
+    memcpy(pwSlot_, oldSlot, kSlot);
+    ops_ = oldOps;
+    mem_ = oldMem;
+    cred_ = oldCred;
+    return false;
 }
 
-bool Vault::newRecovery(QString &recovery)
+void Vault::newRecovery(QString &recovery)
 {
     unsigned char rec[kRecovery], kek[kKey];
     char hex[kRecovery * 2 + 1];
@@ -190,7 +226,6 @@ bool Vault::newRecovery(QString &recovery)
     sodium_memzero(rec, kRecovery);
     sodium_memzero(kek, kKey);
     sodium_memzero(hex, sizeof hex);
-    return true;
 }
 
 bool Vault::create(QByteArray password, QString &recovery)
@@ -203,7 +238,8 @@ bool Vault::create(QByteArray password, QString &recovery)
     }
     randombytes_buf(key_, kKey);
     sodium_mprotect_readonly(key_);
-    if (!setPassword(std::move(password)) || !newRecovery(recovery) || !save(QByteArray())) {
+    newRecovery(recovery); // before setPassword, whose save() writes the recovery slot too
+    if (!setPassword(std::move(password), QByteArray())) {
         close();
         recovery.clear();
         return false;
@@ -229,6 +265,7 @@ bool Vault::decryptData(const QByteArray &data, int headerLen, QByteArray &plain
 
 bool Vault::open(QByteArray password, QByteArray &plain, QString &recovery)
 {
+    close(); // parse() overwrites header fields; never leave them mismatched with an open key
     recovery.clear();
     QByteArray data;
     if (!read(data)) {
@@ -260,6 +297,7 @@ bool Vault::open(QByteArray password, QByteArray &plain, QString &recovery)
 
 bool Vault::openWithRecovery(const QString &recovery, QByteArray &plain)
 {
+    close();
     QByteArray data;
     if (!read(data)) return false;
     const int h = parse(data);
@@ -272,7 +310,10 @@ bool Vault::openWithRecovery(const QString &recovery, QByteArray &plain)
     hex.removeIf([](char c) { return c == '-' || c == ' '; });
     unsigned char rec[kRecovery], kek[kKey];
     size_t len = 0;
-    if (sodium_hex2bin(rec, kRecovery, hex.constData(), hex.size(), nullptr, &len, nullptr) != 0 || len != kRecovery) {
+    const int rc = sodium_hex2bin(rec, kRecovery, hex.constData(), hex.size(), nullptr, &len, nullptr);
+    sodium_memzero(hex.data(), hex.size());
+    if (rc != 0 || len != kRecovery) {
+        sodium_memzero(rec, kRecovery);
         error = "Chave de recuperação inválida.";
         return false;
     }
@@ -293,7 +334,11 @@ bool Vault::openWithRecovery(const QString &recovery, QByteArray &plain)
 
 bool Vault::verifyPassword(QByteArray password)
 {
-    if (!key_) return false;
+    if (!key_) {
+        sodium_memzero(password.data(), password.size());
+        error = kLocked;
+        return false;
+    }
     unsigned char kek[kKey], k[kKey];
     if (!passwordKek(password, kek)) return false;
     const bool ok = unwrap(kek, pwSlot_, k) && sodium_memcmp(k, key_, kKey) == 0;
@@ -353,7 +398,15 @@ bool Vault::openV1(const QByteArray &data, QByteArray &password, QByteArray &pla
     unsigned char secret[kKey], kek[kKey];
     randombytes_buf(secret, kKey);
     QByteArray cred;
-    if (!useTpm_ || !credsFinish(*seal(secret), cred)) cred.clear();
+    if (tpmPresent() && !sealFinish(*seal(creds_, secret), cred)) {
+        sodium_memzero(secret, kKey);
+        sodium_memzero(pwKey, kKey);
+        close();
+        sodium_memzero(plain.data(), plain.size());
+        plain.clear();
+        error = kSealError;
+        return false;
+    }
     crypto_generichash(kek, kKey, cred.isEmpty() ? nullptr : secret, cred.isEmpty() ? 0 : kKey, pwKey, kKey);
     memcpy(pwSalt_, salt, kSalt);
     ops_ = ops;
@@ -364,7 +417,9 @@ bool Vault::openV1(const QByteArray &data, QByteArray &password, QByteArray &pla
     sodium_memzero(pwKey, kKey);
     sodium_memzero(kek, kKey);
 
-    if (!newRecovery(recovery) || !save(plain)) {
+    newRecovery(recovery);
+    // ponytail: a failed save here keeps the v1 file and refuses to open; the user retries once the disk is fixed
+    if (!save(plain)) {
         close();
         recovery.clear();
         sodium_memzero(plain.data(), plain.size());
