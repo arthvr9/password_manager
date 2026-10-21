@@ -2,28 +2,51 @@
 #include <QByteArray>
 #include <QString>
 
-// Encrypted file: "PMV1" | salt(16) | opslimit(u64) | memlimit(u64) | nonce(24) | ciphertext+tag
-// Key = Argon2id(password, salt), cipher = XChaCha20-Poly1305, header authenticated as AAD.
+// The data is encrypted with a random data key K (XChaCha20-Poly1305, whole header as AAD).
+// K is stored wrapped twice, like LUKS key slots:
+//   password slot: KEK = BLAKE2b(key = Argon2id(password), msg = TPM secret)
+//   recovery slot: KEK = BLAKE2b(key = recovery key, msg = salt)
+// The TPM secret is sealed by systemd-creds (tpm2+host, user scoped, no PCRs), so a copied
+// vault file can't be brute-forced off this machine. Without a usable TPM the slot uses the
+// password alone.
+//
+// v2 file: "PMV2" | pw salt(16) | opslimit(u64) | memlimit(u64) | cred len(u32) | cred
+//          | pw slot(72) | rec salt(16) | rec slot(72) | data nonce(24) | ciphertext+tag
 class Vault {
 public:
-    explicit Vault(QString path);
+    explicit Vault(QString path, bool useTpm = true);
     ~Vault();
 
     bool exists() const;
     bool isOpen() const { return key_ != nullptr; }
-    bool create(QByteArray password);                 // new salt + key, writes empty payload
-    bool open(QByteArray password, QByteArray &plain); // false on wrong password or tampered file
+    bool usesTpm() const { return !cred_.isEmpty(); }
+
+    // create() and a v1 upgrade inside open() fill `recovery`; show it to the user once.
+    bool create(QByteArray password, QString &recovery);
+    bool open(QByteArray password, QByteArray &plain, QString &recovery);
+    bool openWithRecovery(const QString &recovery, QByteArray &plain);
+    bool verifyPassword(QByteArray password);
+    bool setPassword(QByteArray password); // re-wraps K under a new password and TPM secret; save() after
     bool save(const QByteArray &plain);
-    void close();                                      // wipes the key
+    void close(); // wipes K
 
     QString error;
 
 private:
-    bool derive(QByteArray &password);
+    bool read(QByteArray &data);
+    int parse(const QByteArray &data); // header length, 0 on error
+    bool passwordKek(QByteArray &password, unsigned char *kek);
+    bool newRecovery(QString &recovery);
+    bool decryptData(const QByteArray &data, int headerLen, QByteArray &plain);
+    bool openV1(const QByteArray &data, QByteArray &password, QByteArray &plain, QString &recovery);
+
     QString path_;
+    bool useTpm_;
     unsigned char *key_ = nullptr; // sodium_malloc'd, mlocked, guarded
-    unsigned char salt_[16];
+    unsigned char pwSalt_[16], recSalt_[16];
+    unsigned char pwSlot_[72], recSlot_[72];
     quint64 ops_ = 0, mem_ = 0;
+    QByteArray cred_;
 };
 
 QString generatePassword(int length, bool upper, bool lower, bool digits, bool symbols);

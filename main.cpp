@@ -22,6 +22,10 @@ QLabel#h1 { font-size: 17pt; font-weight: 600; }
 QLabel#muted, QLabel#field { color: #8a8d93; }
 QLabel#field { font-size: 8.5pt; font-weight: 600; margin-top: 10px; }
 QLabel#error { color: #e5736f; }
+QLabel#recovery {
+    font-family: monospace; font-size: 13pt; background: #1b1c20; border: 1px solid #2b2d32;
+    border-radius: 4px; padding: 14px;
+}
 QLineEdit, QPlainTextEdit, QComboBox, QSpinBox {
     background: #1b1c20; border: 1px solid #2b2d32; border-radius: 4px; padding: 7px 9px;
     selection-background-color: #3d5a99;
@@ -185,6 +189,124 @@ private:
     QPushButton *use_;
 };
 
+static QHBoxLayout *rightAligned(std::initializer_list<QWidget *> ws)
+{
+    auto *r = new QHBoxLayout;
+    r->addStretch();
+    for (QWidget *w : ws) r->addWidget(w);
+    return r;
+}
+
+// Shown once. The checkbox is there so it isn't dismissed by reflex.
+static void showRecoveryKey(QWidget *parent, const QString &key, const QString &intro)
+{
+    QDialog d(parent);
+    d.setWindowTitle("Chave de recuperação");
+    d.setMinimumWidth(460);
+    auto *lay = new QVBoxLayout(&d);
+    lay->setContentsMargins(24, 24, 24, 20);
+    lay->setSpacing(12);
+    auto *text = new QLabel(intro);
+    text->setWordWrap(true);
+    auto *keyLabel = label(key, "recovery");
+    keyLabel->setTextInteractionFlags(Qt::TextSelectableByMouse);
+    keyLabel->setAlignment(Qt::AlignCenter);
+    auto *hint = label("Ela abre o cofre se você esquecer a senha mestra ou se o TPM desta máquina for trocado. "
+                       "Guarde fora do computador. Ela não vai aparecer de novo.",
+                       "muted");
+    hint->setWordWrap(true);
+    auto *check = new QCheckBox("Anotei a chave em um lugar seguro");
+    auto *ok = button("Continuar", "primary");
+    ok->setEnabled(false);
+    QObject::connect(check, &QCheckBox::toggled, ok, &QPushButton::setEnabled);
+    QObject::connect(ok, &QPushButton::clicked, &d, &QDialog::accept);
+    lay->addWidget(text);
+    lay->addWidget(keyLabel);
+    lay->addWidget(hint);
+    lay->addSpacing(4);
+    lay->addWidget(check);
+    lay->addLayout(rightAligned({ok}));
+    d.exec();
+}
+
+// Sets a new master password, asking for the current one first if needed.
+// `apply` gets (current, next) and returns an error message, or an empty string on success.
+class PasswordDialog : public QDialog {
+public:
+    using Apply = std::function<QString(QByteArray, QByteArray)>;
+    PasswordDialog(QWidget *parent, const QString &title, const QString &hint, bool askCurrent, Apply apply)
+        : QDialog(parent), apply_(std::move(apply))
+    {
+        setWindowTitle(title);
+        setMinimumWidth(400);
+        auto *lay = new QVBoxLayout(this);
+        lay->setContentsMargins(24, 24, 24, 20);
+        lay->setSpacing(10);
+        auto *h = label(hint, "muted");
+        h->setWordWrap(true);
+        lay->addWidget(h);
+        lay->addSpacing(4);
+        auto field = [lay](const QString &placeholder) {
+            auto *e = new QLineEdit;
+            e->setEchoMode(QLineEdit::Password);
+            e->setPlaceholderText(placeholder);
+            lay->addWidget(e);
+            return e;
+        };
+        current_ = askCurrent ? field("Senha mestra atual") : nullptr;
+        next_ = field("Nova senha mestra");
+        confirm_ = field("Confirme a nova senha");
+        error_ = label("", "error");
+        error_->setWordWrap(true);
+        error_->hide();
+        lay->addWidget(error_);
+        auto *cancel = button("Cancelar");
+        save_ = button("Salvar", "primary");
+        lay->addSpacing(4);
+        lay->addLayout(rightAligned({cancel, save_}));
+
+        connect(cancel, &QPushButton::clicked, this, &QDialog::reject);
+        connect(save_, &QPushButton::clicked, this, &PasswordDialog::submit);
+        connect(confirm_, &QLineEdit::returnPressed, this, &PasswordDialog::submit);
+        connect(next_, &QLineEdit::returnPressed, confirm_, qOverload<>(&QWidget::setFocus));
+        if (current_) connect(current_, &QLineEdit::returnPressed, next_, qOverload<>(&QWidget::setFocus));
+    }
+
+private:
+    void submit()
+    {
+        auto fail = [this](const QString &msg, QLineEdit *focus) {
+            error_->setText(msg);
+            error_->show();
+            focus->selectAll();
+            focus->setFocus();
+        };
+        if (current_ && current_->text().isEmpty()) return fail("Digite a senha atual.", current_);
+        if (next_->text().size() < 8) return fail("Use pelo menos 8 caracteres.", next_);
+        if (next_->text() != confirm_->text()) return fail("As senhas não conferem.", confirm_);
+
+        save_->setEnabled(false);
+        QApplication::setOverrideCursor(Qt::WaitCursor);
+        QApplication::processEvents();
+        const QString err = apply_(current_ ? current_->text().toUtf8() : QByteArray(), next_->text().toUtf8());
+        QApplication::restoreOverrideCursor();
+        save_->setEnabled(true);
+        if (current_) current_->clear();
+        if (err.isEmpty()) {
+            next_->clear();
+            confirm_->clear();
+            accept();
+        } else {
+            fail(err, current_ ? current_ : next_);
+        }
+    }
+
+    Apply apply_;
+    QLineEdit *current_, *next_, *confirm_;
+    QLabel *error_;
+    QPushButton *save_;
+};
+
 class MainWindow : public QMainWindow {
     Q_OBJECT
     Q_CLASSINFO("D-Bus Interface", "io.github.arthvr9.PassManager")
@@ -199,6 +321,9 @@ public:
         stack_->addWidget(buildMain());
         setCentralWidget(stack_);
         statusBar()->setSizeGripEnabled(false);
+        tpmLabel_ = label("", "muted");
+        tpmLabel_->setContentsMargins(0, 0, 10, 0);
+        statusBar()->addPermanentWidget(tpmLabel_);
         statusBar()->hide();
 
         saveTimer_.setSingleShot(true);
@@ -298,6 +423,7 @@ private:
         unlockError_ = label("", "error");
         unlockError_->setWordWrap(true);
         unlockBtn_ = button("", "primary");
+        recoveryBtn_ = button("", "flat");
 
         lay->addWidget(unlockTitle_);
         lay->addWidget(unlockHint_);
@@ -306,6 +432,7 @@ private:
         lay->addWidget(confirm_);
         lay->addWidget(unlockError_);
         lay->addWidget(unlockBtn_);
+        lay->addWidget(recoveryBtn_);
 
         auto *outer = new QGridLayout(page);
         outer->addWidget(col, 0, 0, Qt::AlignCenter);
@@ -315,17 +442,28 @@ private:
             confirm_->isVisible() ? confirm_->setFocus() : unlock();
         });
         connect(confirm_, &QLineEdit::returnPressed, this, &MainWindow::unlock);
+        connect(recoveryBtn_, &QPushButton::clicked, this, [this] {
+            recoveryMode_ = !recoveryMode_;
+            showUnlock();
+        });
         return page;
     }
 
     void showUnlock()
     {
         const bool first = !vault_.exists();
-        unlockTitle_->setText(first ? "Criar cofre" : "Cofre bloqueado");
-        unlockHint_->setText(first ? "Defina a senha mestra. Ela não pode ser recuperada: se esquecer, "
-                                     "as senhas guardadas são perdidas."
-                                   : "Digite a senha mestra para desbloquear.");
-        unlockBtn_->setText(first ? "Criar cofre" : "Desbloquear");
+        if (first) recoveryMode_ = false;
+        unlockTitle_->setText(recoveryMode_ ? "Recuperar acesso" : first ? "Criar cofre" : "Cofre bloqueado");
+        unlockHint_->setText(recoveryMode_ ? "Digite a chave de recuperação que você anotou ao criar o cofre. "
+                                             "Depois você define uma nova senha mestra."
+                             : first ? "Defina a senha mestra. Em seguida você recebe uma chave de recuperação "
+                                       "para anotar."
+                                     : "Digite a senha mestra para desbloquear.");
+        unlockBtn_->setText(recoveryMode_ ? "Continuar" : first ? "Criar cofre" : "Desbloquear");
+        recoveryBtn_->setText(recoveryMode_ ? "Voltar para a senha mestra" : "Usar chave de recuperação");
+        recoveryBtn_->setVisible(!first);
+        master_->setEchoMode(recoveryMode_ ? QLineEdit::Normal : QLineEdit::Password);
+        master_->setPlaceholderText(recoveryMode_ ? "XXXX-XXXX-XXXX-XXXX-XXXX-XXXX-XXXX-XXXX" : "Senha mestra");
         confirm_->setVisible(first);
         master_->clear();
         confirm_->clear();
@@ -339,6 +477,7 @@ private:
     void unlock()
     {
         const bool first = !vault_.exists();
+        const bool recovering = recoveryMode_ && !first;
         auto fail = [this](const QString &msg) {
             unlockError_->setText(msg);
             unlockError_->show();
@@ -350,12 +489,15 @@ private:
         if (first && master_->text() != confirm_->text()) return fail("As senhas não conferem.");
 
         unlockBtn_->setEnabled(false);
-        unlockBtn_->setText(first ? "Criando..." : "Desbloqueando...");
+        unlockBtn_->setText(recovering ? "Verificando..." : first ? "Criando..." : "Desbloqueando...");
         QApplication::setOverrideCursor(Qt::WaitCursor);
         QApplication::processEvents(); // Argon2id takes ~1s; let the label repaint first
 
         QByteArray plain;
-        const bool ok = first ? vault_.create(master_->text().toUtf8()) : vault_.open(master_->text().toUtf8(), plain);
+        QString recovery;
+        const bool ok = recovering ? vault_.openWithRecovery(master_->text(), plain)
+                        : first    ? vault_.create(master_->text().toUtf8(), recovery)
+                                   : vault_.open(master_->text().toUtf8(), plain, recovery);
         master_->clear();
         confirm_->clear();
         QApplication::restoreOverrideCursor();
@@ -374,8 +516,44 @@ private:
         sidebar_->setCurrentRow(0);
         stack_->setCurrentIndex(1);
         statusBar()->show();
+        updateTpmLabel();
         idleTimer_.start();
         search_->setFocus();
+
+        if (!recovery.isEmpty())
+            showRecoveryKey(this, recovery,
+                            first ? "Cofre criado. Esta é a sua chave de recuperação:"
+                                  : "O cofre foi atualizado para o formato novo, com chave de recuperação e "
+                                    "proteção pelo TPM desta máquina. Esta é a sua chave:");
+        if (recovering) {
+            recoveryMode_ = false;
+            PasswordDialog d(this, "Nova senha mestra", "Acesso recuperado. Defina uma nova senha mestra para continuar.",
+                             false, [this](QByteArray, QByteArray next) { return applyPassword(std::move(next)); });
+            if (d.exec() != QDialog::Accepted) lock();
+        }
+    }
+
+    QString applyPassword(QByteArray next)
+    {
+        if (!vault_.setPassword(std::move(next))) return vault_.error;
+        if (!persist()) return vault_.error;
+        updateTpmLabel();
+        return {};
+    }
+
+    void changePassword()
+    {
+        PasswordDialog d(this, "Trocar senha mestra", "A chave de recuperação continua a mesma.", true,
+                         [this](QByteArray current, QByteArray next) -> QString {
+                             if (!vault_.verifyPassword(std::move(current))) return vault_.error;
+                             return applyPassword(std::move(next));
+                         });
+        if (d.exec() == QDialog::Accepted) statusBar()->showMessage("Senha mestra alterada", 3000);
+    }
+
+    void updateTpmLabel()
+    {
+        tpmLabel_->setText(vault_.usesTpm() ? "Protegido por TPM" : "Sem TPM, só senha mestra");
     }
 
     void lock()
@@ -384,6 +562,7 @@ private:
         if (saveTimer_.isActive()) persist();
         idleTimer_.stop();
         vault_.close();
+        recoveryMode_ = false;
         // ponytail: QString contents can't be reliably wiped; dropping them is best effort
         entries_.clear();
         currentId_.clear();
@@ -404,7 +583,7 @@ private:
         }
     }
 
-    void persist()
+    bool persist()
     {
         saveTimer_.stop();
         QJsonArray arr;
@@ -418,6 +597,7 @@ private:
             statusBar()->showMessage("Salvo", 2000);
         else
             QMessageBox::critical(this, "Erro ao salvar", vault_.error);
+        return ok;
     }
 
     // ---------- main page ----------
@@ -434,13 +614,16 @@ private:
         catLabel->setContentsMargins(14, 0, 0, 0);
         sidebar_ = new QListWidget;
         sidebar_->setObjectName("sidebar");
+        auto *passBtn = button("Trocar senha mestra", "flat");
         auto *lockBtn = button("Bloquear  (Ctrl+L)", "flat");
         sideLay->addWidget(catLabel);
         sideLay->addWidget(sidebar_, 1);
-        auto *lockRow = new QHBoxLayout;
-        lockRow->setContentsMargins(8, 0, 8, 0);
-        lockRow->addWidget(lockBtn);
-        sideLay->addLayout(lockRow);
+        auto *actions = new QVBoxLayout;
+        actions->setContentsMargins(8, 0, 8, 0);
+        actions->setSpacing(2);
+        actions->addWidget(passBtn);
+        actions->addWidget(lockBtn);
+        sideLay->addLayout(actions);
 
         // entry list
         auto *listPane = new QWidget;
@@ -483,6 +666,7 @@ private:
         lay->addWidget(detail_, 1);
 
         connect(lockBtn, &QPushButton::clicked, this, &MainWindow::lock);
+        connect(passBtn, &QPushButton::clicked, this, &MainWindow::changePassword);
         connect(newBtn, &QPushButton::clicked, this, &MainWindow::newEntry);
         connect(search_, &QLineEdit::textChanged, this, &MainWindow::refreshList);
         connect(sidebar_, &QListWidget::currentRowChanged, this, &MainWindow::refreshList);
@@ -766,13 +950,14 @@ private:
     Vault vault_;
     std::vector<Entry> entries_;
     QString currentId_;
-    bool loading_ = false;
+    bool loading_ = false, recoveryMode_ = false;
     QTimer saveTimer_, idleTimer_;
 
     QStackedWidget *stack_, *detail_;
     QLabel *unlockTitle_, *unlockHint_, *unlockError_;
     QLineEdit *master_, *confirm_;
-    QPushButton *unlockBtn_, *reveal_;
+    QPushButton *unlockBtn_, *recoveryBtn_, *reveal_;
+    QLabel *tpmLabel_;
     QListWidget *sidebar_, *list_;
     QLineEdit *search_, *title_, *user_, *pass_, *url_;
     QComboBox *category_;
