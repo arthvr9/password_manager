@@ -1,3 +1,4 @@
+#include "sandbox.h"
 #include "vault.h"
 #include <QtDBus>
 #include <QtWidgets>
@@ -753,7 +754,17 @@ private:
             commit();
         });
         connect(openUrl, &QPushButton::clicked, this, [this] {
-            if (!url_->text().trimmed().isEmpty()) QDesktopServices::openUrl(QUrl::fromUserInput(url_->text().trimmed()));
+            if (url_->text().trimmed().isEmpty()) return;
+            const QUrl url = QUrl::fromUserInput(url_->text().trimmed());
+            if (url.scheme() != "http" && url.scheme() != "https") {
+                statusBar()->showMessage("Só endereços http e https podem ser abertos", 3000);
+                return;
+            }
+            // through the portal, so the browser is started outside this process's sandbox
+            auto msg = QDBusMessage::createMethodCall("org.freedesktop.portal.Desktop", "/org/freedesktop/portal/desktop",
+                                                      "org.freedesktop.portal.OpenURI", "OpenURI");
+            msg << QString() << url.toString() << QVariantMap();
+            QDBusConnection::sessionBus().asyncCall(msg);
         });
         connect(del, &QPushButton::clicked, this, &MainWindow::deleteEntry);
         return form;
@@ -1006,6 +1017,11 @@ int main(int argc, char **argv)
         QDBusInterface(kBusName, "/", kBusName).call("activate");
         return 0;
     }
+
+    const QString cacheDir = QStandardPaths::writableLocation(QStandardPaths::GenericCacheLocation);
+    QDir().mkpath(cacheDir);
+    const QString refused = sandbox({dataDir, cacheDir});
+    if (!refused.isEmpty()) qWarning("pass-manager: kernel refused sandbox layers: %s", qPrintable(refused));
 
     MainWindow w;
     QDBusConnection::sessionBus().registerService(kBusName);
