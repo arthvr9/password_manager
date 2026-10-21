@@ -2,7 +2,7 @@
 
 Gerenciador de senhas local pra Linux, feito em C++ com Qt6. Fiz porque tinha senha espalhada em bloco de notas e cansei de procurar.
 
-Tudo fica num arquivo só, criptografado, na sua máquina. Não tem sincronização, conta, nem nada indo pra internet. E isso não é só promessa: o próprio processo é proibido pelo kernel de abrir conexão de rede (ver Sandbox mais abaixo).
+Tudo fica num arquivo só, criptografado, na sua máquina. Não tem sincronização, conta, nem nada indo pra internet. O próprio kernel impede o processo de abrir conexão de rede (ver Sandbox mais abaixo, inclusive o que ele não cobre).
 
 ## Como funciona
 
@@ -15,7 +15,7 @@ Os dados são cifrados com XChaCha20-Poly1305 usando uma chave aleatória. Essa 
 
 O segredo do TPM é selado pelo `systemd-creds` (modo usuário, `tpm2+host`). Na prática, quem copiar o `vault.bin` não consegue testar senhas em outro computador, mesmo que a sua senha mestra seja fraca. Não amarrei a nenhum PCR, então atualização de BIOS não trava o cofre.
 
-Sem TPM (ou sem `systemd-creds`), o app funciona só com a senha mestra. A barra de status mostra qual dos dois está valendo.
+Se a máquina não tem TPM (ou não tem `systemd-creds`), o app funciona só com a senha mestra, e a barra de status mostra qual dos dois está valendo. Se o TPM existe mas falha na hora de criar o cofre ou trocar a senha, a operação dá erro em vez de seguir sem ele.
 
 Qualquer alteração no arquivo faz ele recusar abrir. O cofre fica em `~/.local/share/pass-manager/vault.bin` com permissão 600, e a gravação é atômica: se cair a energia no meio de um save, o arquivo antigo continua inteiro.
 
@@ -33,7 +33,8 @@ A senha mestra dá pra trocar a qualquer momento pela barra lateral. A chave de 
 
 ## Segurança
 
-- trava sozinho depois de 5 minutos sem uso, quando a tela bloqueia, quando o sistema vai suspender e quando o logind manda bloquear a sessão
+- trava sozinho depois de 5 minutos sem uso, quando a tela bloqueia, quando o logind manda bloquear a sessão e antes do sistema suspender (com um inibidor `delay` do logind, então o suspend espera o cofre travar)
+- ao travar, fecha qualquer diálogo aberto. A exceção é o da chave de recuperação, que só fecha depois de marcar que anotou
 - só roda uma instância por vez (`flock` num arquivo de trava). Abrir de novo só traz a janela já aberta pra frente, via D-Bus. Antes, duas janelas abertas podiam sobrescrever o que a outra salvou
 - a chave fica em memória travada (não vai pro swap) e é apagada ao bloquear
 - o processo desativa core dump e ptrace (`PR_SET_DUMPABLE`)
@@ -41,18 +42,20 @@ A senha mestra dá pra trocar a qualquer momento pela barra lateral. A chave de 
 
 ### Sandbox
 
-Logo depois de iniciar, o processo se tranca, sem volta. Tudo o que ele abrir depois herda as mesmas restrições:
+A primeira coisa que o processo faz, antes de subir o Qt e qualquer thread, é se trancar, sem volta. Tudo o que ele abrir depois (threads e processos filhos) herda as mesmas restrições:
 
 - **Landlock:** só pode criar ou escrever arquivos em `~/.local/share/pass-manager` e `~/.cache`, e só pode executar programas de `/usr` (o `systemd-creds`)
-- **seccomp:** não consegue criar socket IPv4, IPv6 nem de pacote, nem usar io_uring. Socket Unix continua liberado, porque o X11 e o D-Bus precisam
+- **seccomp:** só cria socket Unix (X11 e D-Bus) e netlink (que fala só com o kernel). Qualquer outra família é recusada. Também bloqueia io_uring, `ptrace`, `process_vm_readv/writev` e `pidfd_getfd`, que serviriam pra pegar memória ou socket emprestado de outro processo seu
 
-O Landlock também bloqueia rede, mas nessa versão do kernel ele só cobre TCP. Por isso a rede fica com o seccomp, que corta UDP também.
+O Landlock também sabe bloquear rede, mas nessa versão do kernel ele só cobre TCP. Por isso a rede fica com o seccomp, numa lista do que é permitido, e não do que é proibido: famílias como AF_SMC caem pra TCP comum e passariam por uma lista de bloqueio.
 
 O botão "Abrir" da URL pede pro xdg-desktop-portal abrir o navegador. Assim o navegador não nasce dentro do sandbox, sem internet. Só abre `http` e `https`.
 
 Se o kernel não suportar alguma camada, o app abre do mesmo jeito e avisa no stderr.
 
-Um detalhe: com o X11 encaminhado por SSH (`ssh -X`) a conexão com a tela já existe antes do sandbox, então funciona. Mas qualquer coisa que dependa de abrir conexão de rede nova vai falhar, de propósito.
+**O que o sandbox não cobre.** Ele segura biblioteca bugada ou mal-comportada, não um processo totalmente comprometido. O socket Unix do D-Bus continua aberto, e por ele dá pra pedir pro systemd do usuário rodar um programa fora do sandbox. No X11 qualquer janela consegue ler o teclado de outra. Fechar isso de verdade exigiria filtrar o D-Bus (`xdg-dbus-proxy`) e rodar em Wayland.
+
+X11 encaminhado por SSH (`ssh -X`) não funciona: a conexão com a tela é TCP e só é aberta depois do sandbox.
 
 ### No sistema
 
