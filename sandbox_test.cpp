@@ -1,11 +1,17 @@
 #include "sandbox.h"
 #include <QDir>
 #include <QFile>
+#include <QSaveFile>
 #include <QTemporaryDir>
+#include <atomic>
 #include <cassert>
+#include <cerrno>
 #include <cstdio>
+#include <sys/ptrace.h>
 #include <sys/socket.h>
+#include <sys/syscall.h>
 #include <sys/wait.h>
+#include <thread>
 #include <unistd.h>
 
 static int run(const QString &path)
@@ -21,27 +27,66 @@ static int run(const QString &path)
     return WIFEXITED(status) ? WEXITSTATUS(status) : -1;
 }
 
+static bool socketDenied(int family, int type)
+{
+    const int fd = socket(family, type, 0);
+    if (fd >= 0) close(fd);
+    return fd == -1 && errno == EACCES;
+}
+
+static bool socketAllowed(int family, int type)
+{
+    const int fd = socket(family, type, 0);
+    if (fd >= 0) close(fd);
+    return fd >= 0;
+}
+
+static void checkNetwork()
+{
+    assert(socketDenied(AF_INET, SOCK_STREAM));
+    assert(socketDenied(AF_INET6, SOCK_DGRAM));
+    assert(socketDenied(AF_PACKET, SOCK_RAW));
+    assert(socketDenied(43 /* AF_SMC: falls back to TCP */, SOCK_STREAM));
+    assert(socketAllowed(AF_UNIX, SOCK_STREAM));
+    assert(socketAllowed(AF_NETLINK, SOCK_RAW));
+}
+
 // The sandbox is irreversible, so it runs in a child and the parent cleans up.
 int main()
 {
     QTemporaryDir dir;
     const QString box = dir.filePath("box");
-    QDir().mkpath(box);
-    QFile::copy("/usr/bin/true", box + "/true");
+    assert(QDir().mkpath(box));
+    assert(QFile::copy("/usr/bin/true", box + "/true"));
+    assert(run(box + "/true") == 0); // runnable before the sandbox, so a 127 later means denied
 
     const pid_t pid = fork();
     if (pid == 0) {
-        assert(sandbox({box}).isEmpty());
-        assert(socket(AF_INET, SOCK_STREAM, 0) == -1);
-        assert(socket(AF_INET6, SOCK_DGRAM, 0) == -1);
-        const int local = socket(AF_UNIX, SOCK_STREAM, 0);
-        assert(local >= 0);
-        close(local);
+        // a thread that exists before the sandbox still gets the seccomp filter (TSYNC)
+        std::atomic<int> stage{0};
+        std::thread early([&] {
+            while (stage == 0) usleep(1000);
+            checkNetwork();
+            stage = 2;
+        });
 
-        QFile inside(box + "/file");
-        assert(inside.open(QIODevice::WriteOnly) && inside.write("x") == 1);
-        inside.close();
-        assert(QFile::rename(box + "/file", box + "/renamed")); // QSaveFile does this
+        assert(sandbox({box}).isEmpty());
+        stage = 1;
+        early.join();
+        assert(stage == 2);
+        checkNetwork();
+
+        assert(syscall(SYS_io_uring_setup, 1, nullptr) == -1 && errno == ENOSYS);
+        assert(syscall(SYS_io_uring_enter, -1, 0, 0, 0, nullptr, 0) == -1 && errno == ENOSYS);
+        assert(syscall(SYS_io_uring_register, -1, 0, nullptr, 0) == -1 && errno == ENOSYS);
+        assert(ptrace(PTRACE_TRACEME, 0, nullptr, nullptr) == -1 && errno == EPERM);
+        assert(syscall(SYS_process_vm_readv, getppid(), nullptr, 0, nullptr, 0, 0) == -1 && errno == EPERM);
+        assert(syscall(SYS_process_vm_writev, getppid(), nullptr, 0, nullptr, 0, 0) == -1 && errno == EPERM);
+        assert(syscall(SYS_pidfd_getfd, -1, 0, 0) == -1 && errno == EPERM);
+
+        QSaveFile save(box + "/vault.bin"); // same path the app takes: temp file, then rename
+        assert(save.open(QIODevice::WriteOnly) && save.write("x") == 1 && save.commit());
+        assert(save.open(QIODevice::WriteOnly) && save.write("y") == 1 && save.commit());
         QFile outside(dir.filePath("outside"));
         assert(!outside.open(QIODevice::WriteOnly));
         QFile devnull("/dev/null");

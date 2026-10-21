@@ -30,21 +30,26 @@ static bool landlock(const QStringList &writableDirs)
 
     auto allow = [ruleset](const QByteArray &path, __u64 access) {
         const int fd = open(path.constData(), O_PATH | O_CLOEXEC);
-        if (fd < 0) return;
+        if (fd < 0) return false;
         landlock_path_beneath_attr rule{access, fd};
-        syscall(SYS_landlock_add_rule, ruleset, LANDLOCK_RULE_PATH_BENEATH, &rule, 0);
+        const bool ok = syscall(SYS_landlock_add_rule, ruleset, LANDLOCK_RULE_PATH_BENEATH, &rule, 0) == 0;
         close(fd);
+        return ok;
     };
-    for (const QString &dir : writableDirs) allow(QFile::encodeName(dir), dirWrite);
+    // a missing vault dir rule would make every save fail; better to report Landlock as refused
+    bool ok = true;
+    for (const QString &dir : writableDirs) ok = allow(QFile::encodeName(dir), dirWrite) && ok;
     allow("/dev/null", fileWrite);
     allow("/usr", LANDLOCK_ACCESS_FS_EXECUTE); // systemd-creds
 
-    const bool ok = syscall(SYS_landlock_restrict_self, ruleset, 0) == 0;
+    ok = ok && syscall(SYS_landlock_restrict_self, ruleset, 0) == 0;
     close(ruleset);
     return ok;
 }
 
-// Landlock only covers TCP on this kernel generation, so IP is cut at socket() instead.
+// Landlock only covers TCP on this kernel generation, so the network is cut at socket(), with an
+// allowlist: families like AF_SMC fall back to plain TCP. Also blocks the calls that could borrow
+// a socket or memory from another same-user process (Landlock blocks them too, when present).
 static bool noNetwork()
 {
 #if defined(__x86_64__)
@@ -64,20 +69,27 @@ static bool noNetwork()
         BPF_JUMP(BPF_JMP | BPF_JGE | BPF_K, __X32_SYSCALL_BIT, 0, 1),
         BPF_STMT(BPF_RET | BPF_K, SECCOMP_RET_KILL_PROCESS),
 #endif
-        // io_uring can create sockets without going through socket()
-        BPF_JUMP(BPF_JMP | BPF_JEQ | BPF_K, SYS_io_uring_setup, 0, 1),
-        BPF_STMT(BPF_RET | BPF_K, SECCOMP_RET_ERRNO | ENOSYS),
+        // jump offsets count instructions skipped; sandbox_test checks every branch
+        BPF_JUMP(BPF_JMP | BPF_JEQ | BPF_K, SYS_io_uring_setup, 13, 0), // io_uring opens sockets without socket()
+        BPF_JUMP(BPF_JMP | BPF_JEQ | BPF_K, SYS_io_uring_enter, 12, 0),
+        BPF_JUMP(BPF_JMP | BPF_JEQ | BPF_K, SYS_io_uring_register, 11, 0),
+        BPF_JUMP(BPF_JMP | BPF_JEQ | BPF_K, SYS_ptrace, 11, 0),
+        BPF_JUMP(BPF_JMP | BPF_JEQ | BPF_K, SYS_process_vm_readv, 10, 0),
+        BPF_JUMP(BPF_JMP | BPF_JEQ | BPF_K, SYS_process_vm_writev, 9, 0),
+        BPF_JUMP(BPF_JMP | BPF_JEQ | BPF_K, SYS_pidfd_getfd, 8, 0),
         BPF_JUMP(BPF_JMP | BPF_JEQ | BPF_K, SYS_socket, 1, 0),
         BPF_STMT(BPF_RET | BPF_K, SECCOMP_RET_ALLOW),
         BPF_STMT(BPF_LD | BPF_W | BPF_ABS, offsetof(seccomp_data, args[0])),
-        BPF_JUMP(BPF_JMP | BPF_JEQ | BPF_K, AF_INET, 3, 0),
-        BPF_JUMP(BPF_JMP | BPF_JEQ | BPF_K, AF_INET6, 2, 0),
-        BPF_JUMP(BPF_JMP | BPF_JEQ | BPF_K, AF_PACKET, 1, 0),
-        BPF_STMT(BPF_RET | BPF_K, SECCOMP_RET_ALLOW),
+        BPF_JUMP(BPF_JMP | BPF_JEQ | BPF_K, AF_UNIX, 2, 0),    // X11, D-Bus
+        BPF_JUMP(BPF_JMP | BPF_JEQ | BPF_K, AF_NETLINK, 1, 0), // kernel only, never leaves the machine
         BPF_STMT(BPF_RET | BPF_K, SECCOMP_RET_ERRNO | EACCES),
+        BPF_STMT(BPF_RET | BPF_K, SECCOMP_RET_ALLOW),
+        BPF_STMT(BPF_RET | BPF_K, SECCOMP_RET_ERRNO | ENOSYS),
+        BPF_STMT(BPF_RET | BPF_K, SECCOMP_RET_ERRNO | EPERM),
     };
     sock_fprog prog{sizeof filter / sizeof filter[0], filter};
-    return prctl(PR_SET_SECCOMP, SECCOMP_MODE_FILTER, &prog) == 0;
+    // TSYNC: also filter threads that already exist (main() runs this before any, but cheap insurance)
+    return syscall(SYS_seccomp, SECCOMP_SET_MODE_FILTER, SECCOMP_FILTER_FLAG_TSYNC, &prog) == 0;
 }
 
 QString sandbox(const QStringList &writableDirs)
