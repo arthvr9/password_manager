@@ -27,6 +27,9 @@ public:
     bool create(QByteArray password, QString &recovery);
     bool open(QByteArray password, QByteArray &plain, QString &recovery);
     bool openWithRecovery(const QString &recovery, QByteArray &plain);
+    // Fingerprint unlock: the data key K is kept outside the file (see fingerprint.h) and handed back here.
+    QByteArray dataKey() const; // copy of K; the caller wipes it
+    bool openWithKey(const QByteArray &key, QByteArray &plain);
     bool verifyPassword(QByteArray password);
     // re-wraps K under a new password and TPM secret and saves `plain`; on failure nothing changes
     bool setPassword(QByteArray password, const QByteArray &plain);

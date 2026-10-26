@@ -1,3 +1,4 @@
+#include "fingerprint.h"
 #include "sandbox.h"
 #include "vault.h"
 #include <QtDBus>
@@ -8,6 +9,7 @@
 #include <sys/prctl.h>
 
 static constexpr int kAutoLockMs = 5 * 60 * 1000;
+static constexpr int kFingerprintTries = 5; // then the password is required, like a phone
 static const char *kBusName = "io.github.arthvr9.PassManager";
 
 struct Entry {
@@ -349,6 +351,19 @@ public:
         idleTimer_.setSingleShot(true);
         idleTimer_.setInterval(kAutoLockMs);
         connect(&idleTimer_, &QTimer::timeout, this, &MainWindow::lock);
+
+        connect(&fp_, &Fingerprint::matched, this, &MainWindow::fingerprintUnlock);
+        connect(&fp_, &Fingerprint::noMatch, this, [this] {
+            if (++fpFailures_ < kFingerprintTries) return showUnlockError("Digital não reconhecida. Tente de novo.");
+            fp_.stop();
+            fpReady_ = false;
+            unlockHint_->setText("Digite a senha mestra para desbloquear.");
+            showUnlockError("Muitas tentativas com a digital. Use a senha mestra.");
+        });
+        connect(&fp_, &Fingerprint::unavailable, this, [this] {
+            fpReady_ = false;
+            unlockHint_->setText("Digite a senha mestra para desbloquear.");
+        });
         qApp->installEventFilter(this);
 
         // lock when the session screen locks (GNOME and freedesktop names)
@@ -397,6 +412,13 @@ protected:
             break;
         }
         return QMainWindow::eventFilter(o, e);
+    }
+
+    // the reader is only claimed while this window is focused on the unlock page
+    void changeEvent(QEvent *e) override
+    {
+        if (e->type() == QEvent::ActivationChange) updateFingerprint();
+        QMainWindow::changeEvent(e);
     }
 
     void closeEvent(QCloseEvent *e) override
@@ -486,12 +508,15 @@ private:
     {
         const bool first = !vault_.exists();
         if (first) recoveryMode_ = false;
+        // ready only after a password unlock in this login session left the key in the keyring
+        fpReady_ = !first && !recoveryMode_ && fpFailures_ < kFingerprintTries && quickKey::exists() && fp_.enrolled();
         unlockTitle_->setText(recoveryMode_ ? "Recuperar acesso" : first ? "Criar cofre" : "Cofre bloqueado");
         unlockHint_->setText(recoveryMode_ ? "Digite a chave de recuperação que você anotou ao criar o cofre. "
                                              "Depois você define uma nova senha mestra."
                              : first ? "Defina a senha mestra. Em seguida você recebe uma chave de recuperação "
                                        "para anotar."
-                                     : "Digite a senha mestra para desbloquear.");
+                             : fpReady_ ? "Digite a senha mestra ou encoste o dedo no leitor."
+                                        : "Digite a senha mestra para desbloquear.");
         unlockBtn_->setText(recoveryMode_ ? "Continuar" : first ? "Criar cofre" : "Desbloquear");
         recoveryBtn_->setText(recoveryMode_ ? "Voltar para a senha mestra" : "Usar chave de recuperação");
         recoveryBtn_->setVisible(!first);
@@ -505,18 +530,70 @@ private:
         statusBar()->hide();
         stack_->setCurrentIndex(0);
         master_->setFocus();
+        updateFingerprint();
+    }
+
+    void showUnlockError(const QString &msg)
+    {
+        unlockError_->setText(msg);
+        unlockError_->show();
+        master_->selectAll();
+        master_->setFocus();
+    }
+
+    void updateFingerprint()
+    {
+        if (fpReady_ && stack_->currentIndex() == 0 && isActiveWindow() && !vault_.isOpen())
+            fp_.start();
+        else
+            fp_.stop();
+    }
+
+    void fingerprintUnlock()
+    {
+        QByteArray key = quickKey::load();
+        QByteArray plain;
+        const bool ok = !key.isEmpty() && vault_.openWithKey(key, plain);
+        sodium_memzero(key.data(), key.size());
+        if (!ok) {
+            quickKey::forget(); // stale: the vault was recreated, or the key is gone
+            showUnlock();
+            return showUnlockError("Não deu para abrir com a digital desta vez. Use a senha mestra.");
+        }
+        enterVault(plain);
+        idleTimer_.start();
+    }
+
+    // Keeps K in the kernel keyring for fingerprint unlock, only when a finger is enrolled.
+    void rememberKey()
+    {
+        if (!fp_.enrolled()) return;
+        QByteArray key = vault_.dataKey();
+        quickKey::store(key);
+        sodium_memzero(key.data(), key.size());
+    }
+
+    void enterVault(QByteArray &plain)
+    {
+        fp_.stop();
+        fpFailures_ = 0;
+        load(plain);
+        sodium_memzero(plain.data(), plain.size());
+        currentId_.clear();
+        search_->clear();
+        refreshSidebar();
+        sidebar_->setCurrentRow(0);
+        stack_->setCurrentIndex(1);
+        statusBar()->show();
+        updateTpmLabel();
+        search_->setFocus();
     }
 
     void unlock()
     {
         const bool first = !vault_.exists();
         const bool recovering = recoveryMode_ && !first;
-        auto fail = [this](const QString &msg) {
-            unlockError_->setText(msg);
-            unlockError_->show();
-            master_->selectAll();
-            master_->setFocus();
-        };
+        auto fail = [this](const QString &msg) { showUnlockError(msg); };
         if (master_->text().isEmpty()) return;
         if (first && master_->text().size() < 8) return fail("Use pelo menos 8 caracteres.");
         if (first && master_->text() != confirm_->text()) return fail("As senhas não conferem.");
@@ -540,17 +617,8 @@ private:
             showUnlock();
             return fail(vault_.error);
         }
-        load(plain);
-        sodium_memzero(plain.data(), plain.size());
-
-        currentId_.clear();
-        search_->clear();
-        refreshSidebar();
-        sidebar_->setCurrentRow(0);
-        stack_->setCurrentIndex(1);
-        statusBar()->show();
-        updateTpmLabel();
-        search_->setFocus();
+        enterVault(plain);
+        if (!recovering) rememberKey();
 
         if (!recovery.isEmpty()) {
             const QString intro = first                ? "Cofre criado. Esta é a sua chave de recuperação:"
@@ -567,7 +635,8 @@ private:
             recoveryMode_ = false;
             PasswordDialog d(this, "Nova senha mestra", "Acesso recuperado. Defina uma nova senha mestra para continuar.",
                              false, [this](QByteArray, QByteArray next) { return applyPassword(std::move(next)); });
-            if (d.exec() != QDialog::Accepted) lock();
+            if (d.exec() != QDialog::Accepted) return lock();
+            rememberKey();
         }
     }
 
@@ -1051,6 +1120,9 @@ private:
     }
 
     Vault vault_;
+    Fingerprint fp_;
+    int fpFailures_ = 0;
+    bool fpReady_ = false;
     std::vector<Entry> entries_;
     QString currentId_;
     bool loading_ = false, recoveryMode_ = false, holdIdle_ = false;
