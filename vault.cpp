@@ -332,6 +332,31 @@ bool Vault::openWithRecovery(const QString &recovery, QByteArray &plain)
     return decryptData(data, h, plain);
 }
 
+QByteArray Vault::dataKey() const
+{
+    return key_ ? QByteArray(reinterpret_cast<const char *>(key_), kKey) : QByteArray();
+}
+
+bool Vault::openWithKey(const QByteArray &key, QByteArray &plain)
+{
+    close();
+    QByteArray data;
+    if (!read(data)) return false;
+    const int h = parse(data);
+    if (!h || key.size() != kKey) {
+        error = "Arquivo do cofre inválido.";
+        return false;
+    }
+    key_ = allocKey();
+    if (!key_) {
+        error = "Memória insuficiente.";
+        return false;
+    }
+    memcpy(key_, key.constData(), kKey);
+    sodium_mprotect_readonly(key_);
+    return decryptData(data, h, plain); // a stale key (vault recreated) fails here
+}
+
 bool Vault::verifyPassword(QByteArray password)
 {
     if (!key_) {

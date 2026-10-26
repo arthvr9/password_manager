@@ -19,7 +19,7 @@ pkg_check_modules(SODIUM REQUIRED IMPORTED_TARGET libsodium)
 add_compile_options(-Wall -Wextra -fstack-protector-strong -D_FORTIFY_SOURCE=2)
 add_link_options(-pie -Wl,-z,relro,-z,now)
 
-add_executable(pass-manager main.cpp vault.cpp sandbox.cpp)
+add_executable(pass-manager main.cpp vault.cpp sandbox.cpp fingerprint.cpp)
 target_link_libraries(pass-manager Qt6::Widgets Qt6::DBus PkgConfig::SODIUM)
 
 add_executable(vault_test vault_test.cpp vault.cpp)

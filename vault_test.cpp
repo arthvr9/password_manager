@@ -81,6 +81,16 @@ static void roundtrip(const QString &path, const QString &creds)
         assert(!Vault(path, creds).open("correct horse", plain, none));
         assert(Vault(path, creds).openWithRecovery(recovery, plain)); // recovery slot survives a password change
 
+        // the data key alone opens it (fingerprint path); a wrong key doesn't
+        QByteArray k = v.dataKey();
+        assert(k.size() == 32);
+        Vault byKey(path, creds);
+        assert(byKey.openWithKey(k, plain) && plain == kPlain);
+        k[0] = k[0] ^ 1;
+        assert(!Vault(path, creds).openWithKey(k, plain));
+        assert(!Vault(path, creds).openWithKey(QByteArray(), plain));
+        assert(Vault(path, creds).dataKey().isEmpty()); // closed vault has no key to hand out
+
         QString fresh;
         assert(!v.resetRecovery("wrong", plain, fresh) && fresh.isEmpty());
         assert(v.resetRecovery("battery staple", plain, fresh) && fresh.size() == 39 && fresh != recovery);

@@ -31,6 +31,25 @@ A senha mestra dá pra trocar a qualquer momento pela barra lateral, e a chave d
 
 **Perdeu a senha mestra e a chave de recuperação, perdeu o cofre.**
 
+### Digital
+
+Funciona como no celular. Depois de ligar o notebook ou fazer login, a primeira abertura é pela senha mestra. A partir daí, quando o cofre travar, a tela de desbloqueio aceita a senha ou a digital, o que vier primeiro. Cinco digitais erradas seguidas e ele volta a exigir a senha.
+
+Liga sozinho quando o `fprintd` tem um dedo seu cadastrado:
+
+```
+sudo apt install fprintd
+fprintd-enroll
+```
+
+(ou em Configurações > Usuários > Login por impressão digital, no GNOME)
+
+Como funciona por baixo: o `fprintd` só responde se a digital bateu ou não, ele não guarda chave nenhuma. Então, depois que você abre com a senha, a chave do cofre fica no keyring do kernel (`keyctl`, keyring do usuário). Ela fica na memória do kernel, nunca vai pro swap, e some no logout ou no reboot, por isso a senha volta a ser pedida.
+
+O preço é que, nesse meio tempo, um programa rodando com o seu usuário consegue ler essa chave sem passar pela digital. É o mesmo alcance que esse programa já teria no X11 lendo o teclado enquanto você digita a senha, mas vale saber. Se isso não for aceitável, é só não cadastrar digital.
+
+O leitor só é usado enquanto a janela do cofre está em foco na tela de desbloqueio. No resto do tempo ele fica livre pra tela de bloqueio do GNOME e outros programas.
+
 ## Segurança
 
 - trava sozinho depois de 5 minutos sem uso, quando a tela bloqueia, quando o logind manda bloquear a sessão e antes do sistema suspender (com um inibidor `delay` do logind, então o suspend espera o cofre travar)
@@ -95,7 +114,7 @@ Testes:
 ./build/sandbox_test   # Landlock e seccomp
 ```
 
-O `vault_test` pula a parte do TPM se a máquina não tiver um.
+O `vault_test` pula a parte do TPM se a máquina não tiver um. A digital não tem teste automático: precisa de dedo no leitor.
 
 ## Atalhos
 
